@@ -159,57 +159,6 @@ def create_invoice(songs: list[str], customer_id: int):
         return f"Error creating invoice: {str(e)}"
 
 @tool
-def refund_invoice(invoice_id: int, customer_id: int):
-    """Refund an existing invoice for a customer.
-    Args:
-        invoice_id: ID of the invoice to refund
-        customer_id: ID of the customer requesting the refund
-    """
-    if not invoice_id or not customer_id:
-        return "Error: Both invoice ID and customer ID are required"
-    
-    # Verify invoice belongs to customer
-    verify_query = """
-        SELECT InvoiceId, Total, InvoiceDate
-        FROM invoices
-        WHERE InvoiceId = {} AND CustomerId = {};
-    """.format(invoice_id, customer_id)
-    
-    invoice = db.run(verify_query, include_columns=True)
-    if not invoice:
-        return "Error: No matching invoice found for this customer"
-    
-    try:
-        # Create refund invoice (negative amount)
-        refund_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        refund_query = """
-            INSERT INTO invoices (CustomerId, InvoiceDate, Total)
-            VALUES ({}, '{}', {})
-            RETURNING InvoiceId;
-        """.format(customer_id, refund_date, -invoice[0]['Total'])
-        refund_id = db.run(refund_query)[0][0]
-        
-        # Copy invoice items with negative amounts
-        items_query = """
-            INSERT INTO invoice_items (InvoiceId, TrackId, UnitPrice, Quantity)
-            SELECT {}, TrackId, -UnitPrice, Quantity
-            FROM invoice_items
-            WHERE InvoiceId = {};
-        """.format(refund_id, invoice_id)
-        db.run(items_query)
-        
-        return {
-            "message": "Refund processed successfully",
-            "original_invoice": invoice_id,
-            "refund_invoice": refund_id,
-            "amount": -invoice[0]['Total'],
-            "date": refund_date
-        }
-        
-    except Exception as e:
-        return f"Error processing refund: {str(e)}"
-
-@tool
 def check_upsell_eligibility(customer_id: int):
     """Check if the customer meets the conditions to upsell:
     - Has made at least one purchase above $10, OR
