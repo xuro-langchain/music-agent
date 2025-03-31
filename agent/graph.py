@@ -1,8 +1,9 @@
 import asyncio
+from operator import eq
 import random
 from functools import partial
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from langgraph.types import Command, interrupt
+from langgraph.types import Command, Interrupt, interrupt
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -18,7 +19,6 @@ from agent.tools import (
     get_recommended_upsells, 
     finalize_upsell_decision, 
     create_invoice, 
-    refund_invoice, 
     make_handoff_tool
 )
 
@@ -72,7 +72,7 @@ async def music_node(state: State):
     - Check if a song exists
     - Recommend songs based on genre
 
-    You can also route the customer to other AI agents:
+    You also have tools to route to other agents, which you should use for any tasks you can't accomplish with your tools:
     - `customer`: if you do not have the customer's ID, or the customer asks for ANYTHING not related to music recommendations.
 
     When recommending songs based on genre, sometimes the genre will not be found. In that case, the tools will return information \
@@ -97,7 +97,7 @@ async def invoice_node(state: State):
     - Make a new invoice, which represents selling one or more songs to a customer
     - Refund an invoice, which represents giving a refund to a customer
     
-    You can also route the customer to other AI agents:
+    You also have tools to route to other agents, which you should use for any tasks you can't accomplish with your tools:
     - `customer`: if you do not have the customer's ID, or if you are asked for something you don't know how to help with.
     """
     
@@ -106,7 +106,6 @@ async def invoice_node(state: State):
     # Get response from model
     chain = model.bind_tools([
         create_invoice,
-        refund_invoice,
         sales_handoff,
         customer_handoff,
     ]) | partial(add_name, name="invoice")
@@ -147,7 +146,6 @@ tools = [
     get_recommended_upsells,
     finalize_upsell_decision,
     create_invoice,
-    refund_invoice,
     music_handoff,
     invoice_handoff,
     customer_handoff,
@@ -175,7 +173,7 @@ def _get_internal_transfer_source(messages, agent_name):
             return None
 
         if isinstance(m, AIMessage) and _is_tool_call(m):
-            tool_calls = m["additional_kwargs"]["tool_calls"]
+            tool_calls = m.additional_kwargs["tool_calls"]
             for tool_call in tool_calls:
                 if tool_call["function"]["name"] == f"transfer_to_{agent_name}":
                     return m.name
@@ -193,7 +191,7 @@ def tool_route(state: State):
     else:
         if last_ai_message.name == "music":
             transfer_node = _get_internal_transfer_source(messages, "music")
-            if transfer_node != "customer":
+            if transfer_node != "customer" and transfer_node != "music":
                 return transfer_node
         return last_ai_message.name
 
@@ -259,6 +257,21 @@ def make_graph(memory):
     workflow.set_conditional_entry_point(entry, {"customer": "customer", "tools": "tools", "music": "music", "invoice": "invoice", "sales": "sales", END: END})
     return workflow.compile(checkpointer=memory)
 
+# -----------------------------------------------------------------------
+# RUN FUNCTIONS ---------------------------------------------------------
+# -----------------------------------------------------------------------
+def print_messages(response):
+    if isinstance(response, Interrupt):
+        message = response.value["query"]
+        if message:
+            print("AI:" + message)
+    elif isinstance(response, dict) and "messages" in response:
+        messages = response["messages"]
+        for message in messages:
+            if isinstance(message, AIMessage) and message.content:
+                print(f"{message.name.upper()} AI: {message.content}")
+            if isinstance(message, ToolMessage):
+                print(f"Tool called: {message.name}")
 
 async def run(graph: StateGraph):
     state: State = {
@@ -296,16 +309,14 @@ async def run(graph: StateGraph):
                 for key, value in output.items():
                     print(f"Output from node '{key}':")
                     print("---")
-                    if "messages" in value:
-                        for message in value["messages"]:
-                            if message and message.content:
-                                print(message.content)
+                    # print(value)
+                    print_messages(value)
 
                     if key == "__interrupt__":
                         interrupted = True
         except Exception as e:
             print(f"Error: {str(e)}")
-            continue
+            raise e
 
 async def main():
     async with AsyncSqliteSaver.from_conn_string(":memory:") as memory:

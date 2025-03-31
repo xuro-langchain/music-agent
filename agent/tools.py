@@ -22,7 +22,7 @@ def verify_customer_info(customer_id: int, tool_call_id: Annotated[str, Injected
                 tool_call_id=tool_call_id,
                 name="verify_customer_info"
             )
-            return Command(goto='customer', graph=Command.PARENT, update={"messages": [tool_message]})
+            return Command(goto='customer', update={"messages": [tool_message]})
             
         first, last, zip = parts
         columns = [column.strip("'") for column in customer.split(", ")]
@@ -88,7 +88,7 @@ def recommend_songs_by_genre(genre, customer_id: int):
     return db.run(query, include_columns=True)
 
 @tool
-def create_invoice(songs: list[str], customer_id: int):
+def create_invoice(songs: list[str], customer_id: int, tool_call_id: Annotated[str, InjectedToolCallId]):
     """Create a new invoice for the given songs and customer.
     Args:
         songs: List of song names to purchase
@@ -100,7 +100,7 @@ def create_invoice(songs: list[str], customer_id: int):
         return "Error: No songs provided for invoice"
     
     # Find track IDs for the songs
-    track_ids = []
+    tracks = []
     for song in songs:
         # Get exact or similar matches for the song
         matches = song_retriever.invoke(song, k=1)
@@ -112,13 +112,28 @@ def create_invoice(songs: list[str], customer_id: int):
                 WHERE TrackId = {};
             """.format(matches[0].metadata['TrackId'])
             track = db.run(track_query, include_columns=True)
-            
+            columns = track.split(", ")
+            track_id = columns[0].split(": ")[1]
+            track_name = columns[1].split(": ")[1].strip("'")
+            price = columns[2].split(": ")[1].strip("}]")
             if track:
-                track_ids.append((track[0]['TrackId'], track[0]['UnitPrice']))
+                tracks.append((track_id, track_name, price))
     
-    if not track_ids:
+    if not tracks:
         return "Error: No matching tracks found for the provided songs"
     
+    human_response = interrupt(
+        {"query": "You will be purchasing the following songs: {} \nPlease confirm by typing 'yes' or 'no'".format([track[1] for track in tracks])}
+    )       
+    response = human_response["data"]
+    if response.lower() != "yes":
+        tool_message = ToolMessage(
+            content="Transaction cancelled by customer",
+            tool_call_id=tool_call_id,
+            name="create_invoice"
+        )
+        Command(goto='invoice', update={"messages": [tool_message]})
+
     try:
         # Create new invoice
         invoice_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -126,11 +141,12 @@ def create_invoice(songs: list[str], customer_id: int):
             INSERT INTO invoices (CustomerId, InvoiceDate, Total)
             VALUES ({}, '{}', {})
             RETURNING InvoiceId;
-        """.format(customer_id, invoice_date, sum(price for _, price in track_ids))
-        invoice_id = db.run(invoice_query)[0][0]
+        """.format(customer_id, invoice_date, sum(float(price) for _, _, price in tracks))
+        invoice_id = db.run(invoice_query, include_columns=True)
+        invoice_id = invoice_id.split(": ")[1].strip("}]")
         
         # Add invoice lines
-        for track_id, unit_price in track_ids:
+        for track_id, _, unit_price in tracks:
             line_query = """
                 INSERT INTO invoice_items (InvoiceId, TrackId, UnitPrice, Quantity)
                 VALUES ({}, {}, {}, 1);
@@ -146,22 +162,27 @@ def create_invoice(songs: list[str], customer_id: int):
             WHERE inv.InvoiceId = {};
         """.format(invoice_id)
         details = db.run(details_query, include_columns=True)
-        
-        return {
-            "message": "Invoice created successfully",
-            "invoice_id": invoice_id,
-            "date": details[0]['InvoiceDate'],
-            "items": [{"song": d['SongName'], "price": d['UnitPrice']} for d in details],
-            "total": sum(d['UnitPrice'] for d in details)
-        }
-        
+        rows = details.split("}, {")
+        if (len(rows) == len(songs)):
+            tool_message = ToolMessage(
+                content="Transaction successfully completed!",
+                tool_call_id=tool_call_id,
+                name="create_invoice"
+            )
+            return Command(goto='invoice', update={"messages": [tool_message]})
+        tool_message = ToolMessage(
+            content="Transaction encountered error",
+            tool_call_id=tool_call_id,
+            name="create_invoice"
+        )
+        return Command(goto='invoice', update={"messages": [tool_message]})
     except Exception as e:
         return f"Error creating invoice: {str(e)}"
 
 @tool
 def check_upsell_eligibility(customer_id: int):
     """Check if the customer meets the conditions to upsell:
-    - Has made at least one purchase above $10, OR
+    - Has made at least one purchase above $2, OR
     - Has only made one purchase total
     """
     if not customer_id:
@@ -176,8 +197,8 @@ def check_upsell_eligibility(customer_id: int):
         SELECT 
             total_purchases, highest_purchase,
             CASE 
-                WHEN total_purchases = 1 THEN true  -- First-time buyer
-                WHEN highest_purchase >= 10 THEN true  -- Has made a $10+ purchase
+                WHEN total_purchases = 1 THEN true  
+                WHEN highest_purchase >= 2 THEN true  
                 ELSE false
             END as should_upsell
         FROM customer_stats;
@@ -189,15 +210,74 @@ def check_upsell_eligibility(customer_id: int):
     return True
 
 @tool
-def get_recommended_upsells():
-    """Get recommended upsells based on customer's purchase history."""
-    return None
+def get_recommended_upsells(customer_id: int, tool_call_id: Annotated[str, InjectedToolCallId]):
+    """Get recommended upsells based on customer's most recent invoice's most common genre.
+    Args:
+        customer_id: ID of the customer to get recommendations for
+    Returns:
+        The most common genre in the customer's most recent invoice
+    """
+    query = """
+        WITH LastInvoice AS (
+            SELECT InvoiceId
+            FROM invoices
+            WHERE CustomerId = {}
+            ORDER BY InvoiceDate DESC
+            LIMIT 1
+        ),
+        GenreCounts AS (
+            SELECT g.Name as GenreName, COUNT(*) as GenreCount
+            FROM LastInvoice li
+            JOIN invoice_items ii ON li.InvoiceId = ii.InvoiceId
+            JOIN tracks t ON ii.TrackId = t.TrackId
+            JOIN genres g ON t.GenreId = g.GenreId
+            GROUP BY g.GenreId, g.Name
+            ORDER BY GenreCount DESC
+            LIMIT 1
+        )
+        SELECT GenreName, GenreCount
+        FROM GenreCounts;
+    """.format(customer_id)
     
+    result = db.run(query, include_columns=True)
+    if result:
+        # Result will be in format: "[{GenreName: 'Rock', GenreCount: 3}]"
+        genre = result.split("'")[1] if "'" in result else None
+        
+        tool_message = ToolMessage(
+            content=f"Recommended genre for customer {customer_id}: {genre}. Handing off to music agent for recommendations",
+            tool_call_id=tool_call_id,
+            name="get_recommended_upsells"
+        )
+        return Command(
+            goto='music',
+            update={ "messages": [tool_message]},
+        )
+    tool_message = ToolMessage(
+        content=f"No recommended genres found for customer {customer_id}. Handing back to sales to reject upsell.",
+        tool_call_id=tool_call_id,
+        name="get_recommended_upsells"
+    )
+    return Command(
+        goto='sales',
+        update={ "messages": [tool_message]},
+    )
 
 @tool
-def finalize_upsell_decision():
-    """Finalize whether or not to upsell the customer."""
-    return None
+def finalize_upsell_decision(upsell: bool, song: str | None, tool_call_id: Annotated[str, InjectedToolCallId]):
+    """Finalize whether or not to upsell the customer. Song must be provided if upselling - if it is not, no upsell will be made"""
+    message = "No, do not upsell"
+    if upsell and song is not None:
+        message = "Yes, upsell {}".format(song)
+    tool_message = ToolMessage(
+        content=f"Final upsell decision: {message}",
+        tool_call_id=tool_call_id,
+        name="finalize_upsell_decision"
+    )
+    return Command(
+        goto='invoice',
+        update={ "messages": [tool_message]},
+    )
 
 
 def make_handoff_tool(*, agent_name: str):
