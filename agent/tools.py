@@ -20,7 +20,8 @@ def verify_customer_info(customer_id: int, tool_call_id: Annotated[str, Injected
             tool_message = ToolMessage(
                 content="Invalid format. Please provide your first name, last name, and zip code separated by spaces.",
                 tool_call_id=tool_call_id,
-                name="verify_customer_info"
+                name="verify_customer_info",
+                artifact={"type": "transfer_to_customer", "customer_id": None},
             )
             return Command(goto='customer', update={"messages": [tool_message]})
             
@@ -34,7 +35,8 @@ def verify_customer_info(customer_id: int, tool_call_id: Annotated[str, Injected
             tool_message = ToolMessage(
                 content="Successfully verified customer information",
                 tool_call_id=tool_call_id,
-                name="verify_customer_info"
+                name="verify_customer_info",
+                artifact={"type": "transfer_to_customer", "customer_id": customer_id},
             )
             return Command(
                 goto='customer',
@@ -46,7 +48,8 @@ def verify_customer_info(customer_id: int, tool_call_id: Annotated[str, Injected
     tool_message = ToolMessage(
         content="Failed to verify customer information",
         tool_call_id=tool_call_id,
-        name="verify_customer_info"
+        name="verify_customer_info",
+        artifact={"type": "transfer_to_customer", "customer_id": None},
     )
     return Command(goto='customer', update={"messages": [tool_message], "customer_id": None})
 
@@ -130,7 +133,8 @@ def create_invoice(songs: list[str], customer_id: int, tool_call_id: Annotated[s
         tool_message = ToolMessage(
             content="Transaction cancelled by customer",
             tool_call_id=tool_call_id,
-            name="create_invoice"
+            name="create_invoice",
+            artifact={"type": "transfer_to_invoice", "invoice_id": None},
         )
         Command(goto='invoice', update={"messages": [tool_message]})
 
@@ -167,13 +171,15 @@ def create_invoice(songs: list[str], customer_id: int, tool_call_id: Annotated[s
             tool_message = ToolMessage(
                 content="Transaction successfully completed!",
                 tool_call_id=tool_call_id,
+                artifact={"type": "transfer_to_sales", "invoice_id": invoice_id},
                 name="create_invoice"
             )
-            return Command(goto='invoice', update={"messages": [tool_message]})
+            return Command(goto='sales', update={"messages": [tool_message]})
         tool_message = ToolMessage(
             content="Transaction encountered error",
             tool_call_id=tool_call_id,
-            name="create_invoice"
+            artifact={"type": "transfer_to_invoice", "invoice_id": None},
+            name="create_invoice",
         )
         return Command(goto='invoice', update={"messages": [tool_message]})
     except Exception as e:
@@ -241,13 +247,14 @@ def get_recommended_upsells(customer_id: int, tool_call_id: Annotated[str, Injec
     
     result = db.run(query, include_columns=True)
     if result:
-        # Result will be in format: "[{GenreName: 'Rock', GenreCount: 3}]"
-        genre = result.split("'")[1] if "'" in result else None
+        # Result will be in format: "[{'GenreName': 'Rock', 'GenreCount': 3}]"
+        genre = result.split("'")[3] if "'" in result else None
         
         tool_message = ToolMessage(
             content=f"Recommended genre for customer {customer_id}: {genre}. Handing off to music agent for recommendations",
             tool_call_id=tool_call_id,
-            name="get_recommended_upsells"
+            name="get_recommended_upsells",
+            artifact={"type": "transfer_to_music", "genre": genre},
         )
         return Command(
             goto='music',
@@ -256,7 +263,8 @@ def get_recommended_upsells(customer_id: int, tool_call_id: Annotated[str, Injec
     tool_message = ToolMessage(
         content=f"No recommended genres found for customer {customer_id}. Handing back to sales to reject upsell.",
         tool_call_id=tool_call_id,
-        name="get_recommended_upsells"
+        name="get_recommended_upsells",
+        artifact={"type": "transfer_to_sales", "genre": None},
     )
     return Command(
         goto='sales',
@@ -272,7 +280,8 @@ def finalize_upsell_decision(upsell: bool, song: str | None, tool_call_id: Annot
     tool_message = ToolMessage(
         content=f"Final upsell decision: {message}",
         tool_call_id=tool_call_id,
-        name="finalize_upsell_decision"
+        name="finalize_upsell_decision",
+        artifact={"type": "transfer_to_invoice"},
     )
     return Command(
         goto='invoice',
@@ -293,6 +302,7 @@ def make_handoff_tool(*, agent_name: str):
             content=f"Successfully transferred to {agent_name}",
             name=tool_name,
             tool_call_id=tool_call_id,
+            artifact={"type": "transfer_to_" + agent_name},
         )
         return Command(
             goto=agent_name,

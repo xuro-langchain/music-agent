@@ -30,7 +30,6 @@ model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4-turbo-preview")
 # NODE DEFINITIONS ------------------------------------------------------
 # -----------------------------------------------------------------------
 
-sales_handoff = make_handoff_tool(agent_name="sales")
 customer_handoff = make_handoff_tool(agent_name="customer")
 invoice_handoff = make_handoff_tool(agent_name="invoice")
 music_handoff = make_handoff_tool(agent_name="music")
@@ -99,6 +98,10 @@ async def invoice_node(state: State):
     
     You also have tools to route to other agents, which you should use for any tasks you can't accomplish with your tools:
     - `customer`: if you do not have the customer's ID, or if you are asked for something you don't know how to help with.
+
+    IMPORTANT: If you are making a new invoice as a result of an upsell, you should tell the customer that you \
+    have found additional songs they may like. NEVER use the word "upsell" in your response, instead use language like "I \
+    have found some songs that I think you might like".
     """
     
     formatted = [SystemMessage(content=invoice_prompt)] + state["messages"]
@@ -106,7 +109,6 @@ async def invoice_node(state: State):
     # Get response from model
     chain = model.bind_tools([
         create_invoice,
-        sales_handoff,
         customer_handoff,
     ]) | partial(add_name, name="invoice")
     response = await chain.ainvoke(formatted)
@@ -114,16 +116,19 @@ async def invoice_node(state: State):
 
 
 async def sales_node(state: State):
-    sales_prompt = """Your job is to help a customer with anything related to sales or upselling. 
+    sales_prompt = """Your job is call tools to determine whether or not to upsell a customer. You must NEVER respond beyond calling tools.
     
     You have tools available to help take actions on sales. You can:
     - Check if a customer is eligible for upselling
     - Get recommended songs to upsell. This will handoff to the music agent.
     - Decide whether or not to upsell. This will route back to the invoice agent.
+
+    You also have tools to route to other agents. You can:
+    - `invoice`: if no other tools are applicable, always route to the invoice agent rather than responding.
     
     IMPORTANT: If a customer is eligible for upselling, you MUST get recommended songs to upsell before you decide whether or not to upsell.
-    IMPORTANT: You should only upsell to each customer ONCE per session. You should take into account the customer's behavior and the popularity of the recommended songs when deciding whether or not to upsell.
-    IMPORTANT: NEVER mention the word "upsell" in your response - use language like "I think you might like this song" instead.
+    IMPORTANT: You should only upsell to each customer ONCE per session. If you decide not to upsell, you should route back to the invoice agent.
+    IMPORTANT: NEVER respond - only call tools.
     """
     formatted = [SystemMessage(content=sales_prompt)] + state["messages"]
     
@@ -132,6 +137,7 @@ async def sales_node(state: State):
         check_upsell_eligibility,
         get_recommended_upsells,
         finalize_upsell_decision,
+        invoice_handoff
     ]) | partial(add_name, name="sales")
     response = await chain.ainvoke(formatted)
     return {"messages": [response]}
@@ -149,7 +155,6 @@ tools = [
     music_handoff,
     invoice_handoff,
     customer_handoff,
-    sales_handoff,
 ]
 tool_node = ToolNode(tools=tools)
 
@@ -158,40 +163,41 @@ tool_node = ToolNode(tools=tools)
 # ROUTING HELPERS -------------------------------------------------------
 # -----------------------------------------------------------------------
 
-def _is_tool_call(msg):
-    return hasattr(msg, "additional_kwargs") and 'tool_calls' in msg.additional_kwargs
-
 def _get_last_ai_message(messages):
     for m in messages[::-1]:
         if isinstance(m, AIMessage):
             return m
     return None
 
+def _is_tool_call(msg):
+    return hasattr(msg, "additional_kwargs") and 'tool_calls' in msg.additional_kwargs
+
+def _is_internal_transfer(msg):
+    return hasattr(msg, "artifact") and msg.artifact and  \
+        "type" in msg.artifact and \
+        msg.artifact["type"].startswith("transfer_to")
+
 def _get_internal_transfer_source(messages, agent_name):
     for m in messages[::-1]:
         if isinstance(m, HumanMessage):
             return None
-
-        if isinstance(m, AIMessage) and _is_tool_call(m):
-            tool_calls = m.additional_kwargs["tool_calls"]
-            for tool_call in tool_calls:
-                if tool_call["function"]["name"] == f"transfer_to_{agent_name}":
-                    return m.name
+        if isinstance(m, AIMessage):
+            if m.name != agent_name:
+                return m.name
     return None
-
 
 def tool_route(state: State):
     messages = state["messages"]
     last_ai_message = _get_last_ai_message(messages)
     last_message = messages[-1]
-    if isinstance(last_message, ToolMessage) and last_message.name.startswith("transfer_to_"):
-        return last_message.name[12:]
+    if isinstance(last_message, ToolMessage) and _is_internal_transfer(last_message):
+        return last_message.artifact["type"][12:] # parse out transfer_to_ prefix
     if last_ai_message is None:
         return "customer"
     else:
         if last_ai_message.name == "music":
             transfer_node = _get_internal_transfer_source(messages, "music")
-            if transfer_node != "customer" and transfer_node != "music":
+            if transfer_node != "customer":
                 return transfer_node
         return last_ai_message.name
 
@@ -215,24 +221,6 @@ def sales_route(state: State):
     else:
         return "tools"
 
-def entry(state: State):
-    messages = state["messages"]
-    last_message = messages[-1]
-    if isinstance(last_message, AIMessage):
-        if not _is_tool_call(last_message):
-            return "sales" if last_message.name == "sales" else END
-        else:
-            return "tools"
-    last_m = _get_last_ai_message(messages)
-    if last_m is None:
-        return "customer"
-    if last_m.name == "music":
-        return "music"
-    if last_m.name == "invoice":
-        return "invoice"
-    if last_m.name == "sales":
-        return "sales"
-    return "customer"
 
 # -----------------------------------------------------------------------
 # GRAPH DEFINITION ------------------------------------------------------
@@ -254,17 +242,17 @@ def make_graph(memory):
     workflow.add_conditional_edges("music", general_route, {"customer": "customer", "tools": "tools", END: END})
     workflow.add_conditional_edges("invoice", general_route, {"customer": "customer", "tools": "tools", END: END})
     workflow.add_conditional_edges("sales", sales_route, {"customer": "customer", "sales": "sales", "tools": "tools"})
-    workflow.set_conditional_entry_point(entry, {"customer": "customer", "tools": "tools", "music": "music", "invoice": "invoice", "sales": "sales", END: END})
+    workflow.set_entry_point("customer")
     return workflow.compile(checkpointer=memory)
 
 # -----------------------------------------------------------------------
 # RUN FUNCTIONS ---------------------------------------------------------
 # -----------------------------------------------------------------------
 def print_messages(response):
-    if isinstance(response, Interrupt):
-        message = response.value["query"]
+    if isinstance(response, tuple) and isinstance(response[0], Interrupt):
+        message = response[0].value["query"]
         if message:
-            print("AI:" + message)
+            print("AI: " + message)
     elif isinstance(response, dict) and "messages" in response:
         messages = response["messages"]
         for message in messages:
@@ -307,9 +295,6 @@ async def run(graph: StateGraph):
                     continue
                 # Print any node outputs
                 for key, value in output.items():
-                    print(f"Output from node '{key}':")
-                    print("---")
-                    # print(value)
                     print_messages(value)
 
                     if key == "__interrupt__":
