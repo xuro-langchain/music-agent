@@ -82,7 +82,9 @@ async def music_node(state: State):
 
     tool_choice = "auto"
     if _is_internal_transfer(state["messages"][-1]):
-        tool_choice = "any"
+        transfer_node = _get_internal_transfer_source(state["messages"], "music")
+        if transfer_node and transfer_node != "customer":
+            tool_choice = "any"
 
     chain = model.bind_tools([
         recommend_songs_by_genre, 
@@ -226,12 +228,8 @@ def music_route(state: State):
 
 def music_tools_route(state: State):
     messages = state["messages"]
-    last_message = messages[-1]
-    if _is_internal_transfer(last_message):
-        return last_message.artifact["type"][12:] # parse out transfer_to_ prefix
-    
     transfer_node = _get_internal_transfer_source(messages, "music")
-    if transfer_node != "customer":
+    if transfer_node and transfer_node != "customer":
         return transfer_node
     return "music"
 
