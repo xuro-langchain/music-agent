@@ -125,8 +125,11 @@ def create_invoice(songs: list[str], customer_id: int, tool_call_id: Annotated[s
     if not tracks:
         return "Error: No matching tracks found for the provided songs"
     
+    interrupt_message =  "You will be purchasing the following songs: {}".format([track[1] for track in tracks]) + \
+    ". Your total is: {}".format(sum([float(track[2]) for track in tracks])) + \
+    "\nPlease confirm by typing 'yes' or 'no'"
     human_response = interrupt(
-        {"query": "You will be purchasing the following songs: {} \nPlease confirm by typing 'yes' or 'no'".format([track[1] for track in tracks])}
+        {"query": interrupt_message}
     )       
     response = human_response["data"]
     if response.lower() != "yes":
@@ -188,30 +191,23 @@ def create_invoice(songs: list[str], customer_id: int, tool_call_id: Annotated[s
 @tool
 def check_upsell_eligibility(customer_id: int):
     """Check if the customer meets the conditions to upsell:
-    - Has made at least one purchase above $2, OR
+    - Has made at least one purchase above $5, OR
     - Has only made one purchase total
     """
     if not customer_id:
         return "Error: Customer ID is required"
     
     query = """
-        WITH customer_stats AS (
-            SELECT COUNT(*) as total_purchases, MAX(Total) as highest_purchase
-            FROM invoices
-            WHERE CustomerId = {} AND Total > 0
-        )
-        SELECT 
-            total_purchases, highest_purchase,
-            CASE 
-                WHEN total_purchases = 1 THEN true  
-                WHEN highest_purchase >= 2 THEN true  
-                ELSE false
-            END as should_upsell
-        FROM customer_stats;
+        SELECT COUNT(*) as total_purchases, MAX(Total) as highest_purchase
+        FROM invoices
+        WHERE CustomerId = {} AND Total > 0
     """.format(customer_id)
         
     result = db.run(query, include_columns=True)
-    if not result:
+    fragments = result.split(", ")
+    total_purchases = fragments[0].split(": ")[1]
+    highest_purchase = fragments[1].split(": ")[1].strip("}]")
+    if int(total_purchases) != 1 and float(highest_purchase) < 5:
         return False
     return True
 
