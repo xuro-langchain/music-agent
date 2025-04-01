@@ -30,7 +30,6 @@ model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4-turbo-preview")
 # NODE DEFINITIONS ------------------------------------------------------
 # -----------------------------------------------------------------------
 
-customer_handoff = make_handoff_tool(agent_name="customer")
 invoice_handoff = make_handoff_tool(agent_name="invoice")
 music_handoff = make_handoff_tool(agent_name="music")
 
@@ -71,8 +70,9 @@ async def music_node(state: State):
     - Check if a song exists
     - Recommend songs based on genre
 
-    You also have tools to route to other agents, which you should use for any tasks you can't accomplish with your tools:
-    - `customer`: if you do not have the customer's ID, or the customer asks for ANYTHING not related to music recommendations.
+    IMPORTANT: If you do not have the customer's ID, or \
+    the customer asks for ANYTHING not related to music recommendations, \
+    respond that you need to transfer the customer to the customer agent.
 
     When recommending songs based on genre, sometimes the genre will not be found. In that case, the tools will return information \
     on simliar songs and artists. This is intentional, it IS NOT the tool messing up.
@@ -80,11 +80,14 @@ async def music_node(state: State):
     
     formatted = [SystemMessage(content=song_system_message)] + state["messages"]
 
+    tool_choice = "auto"
+    if _is_internal_transfer(state["messages"][-1]):
+        tool_choice = "any"
+
     chain = model.bind_tools([
         recommend_songs_by_genre, 
         check_for_songs,
-        customer_handoff,
-    ]) | partial(add_name, name="music")
+    ], tool_choice=tool_choice) | partial(add_name, name="music")
     response = await chain.ainvoke(formatted)
     return {"messages": [response]}
 
@@ -94,10 +97,10 @@ async def invoice_node(state: State):
     
     You have tools available to help take actions on invoices. You can:
     - Make a new invoice, which represents selling one or more songs to a customer
-    - Refund an invoice, which represents giving a refund to a customer
     
-    You also have tools to route to other agents, which you should use for any tasks you can't accomplish with your tools:
-    - `customer`: if you do not have the customer's ID, or if you are asked for something you don't know how to help with.
+    IMPORTANT: If you do not have the customer's ID, or \
+    the customer asks for ANYTHING you cannot accomplish with your tools, \
+    respond that you need to transfer the customer to the customer agent.
 
     IMPORTANT: If you are making a new invoice as a result of an upsell, you should tell the customer that you \
     have found additional songs they may like. NEVER use the word "upsell" in your response, instead use language like "I \
@@ -109,26 +112,21 @@ async def invoice_node(state: State):
     # Get response from model
     chain = model.bind_tools([
         create_invoice,
-        customer_handoff,
     ]) | partial(add_name, name="invoice")
     response = await chain.ainvoke(formatted)
     return {"messages": [response]}
 
 
 async def sales_node(state: State):
-    sales_prompt = """Your job is call tools to determine whether or not to upsell a customer. You must NEVER respond beyond calling tools.
+    sales_prompt = """Your job is to determine whether to sell \
+    additional songs (upsell) to the customer after a purchase.
     
-    You have tools available to help take actions on sales. You can:
-    - Check if a customer is eligible for upselling
+    You must call one of the following tools:
+    - Check customer eligibility for upselling. 
     - Get recommended songs to upsell. This will handoff to the music agent.
-    - Decide whether or not to upsell. This will route back to the invoice agent.
-
-    You also have tools to route to other agents. You can:
-    - `invoice`: if no other tools are applicable, always route to the invoice agent rather than responding.
+    - Finalize decision on whether or not to upsell. This will handoff to the invoice agent.
     
-    IMPORTANT: If a customer is eligible for upselling, you MUST get recommended songs to upsell before you decide whether or not to upsell.
-    IMPORTANT: You should only upsell to each customer ONCE per session. If you decide not to upsell, you should route back to the invoice agent.
-    IMPORTANT: NEVER respond - only call tools.
+    IMPORTANT: You should only upsell to each customer ONCE per session.
     """
     formatted = [SystemMessage(content=sales_prompt)] + state["messages"]
     
@@ -137,26 +135,26 @@ async def sales_node(state: State):
         check_upsell_eligibility,
         get_recommended_upsells,
         finalize_upsell_decision,
-        invoice_handoff
-    ]) | partial(add_name, name="sales")
+    ], tool_choice="any") | partial(add_name, name="sales")
     response = await chain.ainvoke(formatted)
     return {"messages": [response]}
 
 
 # Define available tools
-tools = [
-    verify_customer_info,
-    recommend_songs_by_genre, 
-    check_for_songs, 
-    check_upsell_eligibility,
-    get_recommended_upsells,
-    finalize_upsell_decision,
-    create_invoice,
-    music_handoff,
-    invoice_handoff,
-    customer_handoff,
-]
-tool_node = ToolNode(tools=tools)
+customer_tools = [verify_customer_info]
+customer_tool_node = ToolNode(tools=customer_tools)
+
+music_tools = [recommend_songs_by_genre, check_for_songs]
+music_tool_node = ToolNode(tools=music_tools)
+
+invoice_tools = [create_invoice]
+invoice_tool_node = ToolNode(tools=invoice_tools)
+
+sales_tools = [check_upsell_eligibility, get_recommended_upsells, finalize_upsell_decision]
+sales_tool_node = ToolNode(tools=sales_tools)
+
+handoff_tools = [music_handoff, invoice_handoff]
+handoff_tool_node = ToolNode(tools=handoff_tools)
 
 
 # -----------------------------------------------------------------------
@@ -172,9 +170,15 @@ def _get_last_ai_message(messages):
 def _is_tool_call(msg):
     return hasattr(msg, "additional_kwargs") and 'tool_calls' in msg.additional_kwargs
 
+def _get_tools_called(msg) -> list[str]:
+    calls = []
+    for call in msg.additional_kwargs["tool_calls"]:
+        calls.append(call["function"]["name"])
+    return calls
+
 def _is_internal_transfer(msg):
-    return hasattr(msg, "artifact") and msg.artifact and  \
-        "type" in msg.artifact and \
+    return isinstance(msg, ToolMessage) and hasattr(msg, "artifact") and \
+        msg.artifact and "type" in msg.artifact and \
         msg.artifact["type"].startswith("transfer_to")
 
 def _get_internal_transfer_source(messages, agent_name):
@@ -186,22 +190,11 @@ def _get_internal_transfer_source(messages, agent_name):
                 return m.name
     return None
 
-def tool_route(state: State):
-    messages = state["messages"]
-    last_ai_message = _get_last_ai_message(messages)
-    last_message = messages[-1]
-    if isinstance(last_message, ToolMessage) and _is_internal_transfer(last_message):
-        return last_message.artifact["type"][12:] # parse out transfer_to_ prefix
-    if last_ai_message is None:
-        return "customer"
-    else:
-        if last_ai_message.name == "music":
-            transfer_node = _get_internal_transfer_source(messages, "music")
-            if transfer_node != "customer":
-                return transfer_node
-        return last_ai_message.name
+# -----------------------------------------------------------------------
+# ROUTING FUNCTIONS -----------------------------------------------------
+# -----------------------------------------------------------------------
 
-def general_route(state: State):
+def customer_route(state: State):
     messages = state["messages"]
     last_ai_message = _get_last_ai_message(messages)
     if last_ai_message is None:
@@ -209,18 +202,72 @@ def general_route(state: State):
     if not _is_tool_call(last_ai_message):
         return END
     else:
-        return "tools"
+        calls = _get_tools_called(last_ai_message)
+        transfers = [call for call in calls if call.startswith("transfer_to_")]
+        if len(transfers) != 0 and len(transfers) != 1:
+            raise ValueError("Multiple transfers in a single tool call")
+        if len(transfers) == 1:
+            return "handoff_tools"
+        if len(transfers) == 0:
+            return "customer_tools"
 
-def sales_route(state: State):
+def customer_tools_route(state: State):
+    return "customer"
+    
+def music_route(state: State):
     messages = state["messages"]
     last_ai_message = _get_last_ai_message(messages)
     if last_ai_message is None:
-        return "customer"
+        return END
     if not _is_tool_call(last_ai_message):
-        return "sales"
+        return END
     else:
-        return "tools"
+        return "music_tools"
 
+def music_tools_route(state: State):
+    messages = state["messages"]
+    last_message = messages[-1]
+    if _is_internal_transfer(last_message):
+        return last_message.artifact["type"][12:] # parse out transfer_to_ prefix
+    
+    transfer_node = _get_internal_transfer_source(messages, "music")
+    if transfer_node != "customer":
+        return transfer_node
+    return "music"
+
+def invoice_route(state: State):
+    messages = state["messages"]
+    last_ai_message = _get_last_ai_message(messages)
+    if last_ai_message is None:
+        return END
+    if not _is_tool_call(last_ai_message):
+        return END
+    else:
+        return "invoice_tools"
+
+def invoice_tools_route(state: State):
+    messages = state["messages"]
+    last_message = messages[-1]
+    if _is_internal_transfer(last_message):
+        return last_message.artifact["type"][12:] # parse out transfer_to_ prefix
+    return "invoice"
+
+def sales_route(state: State):
+    return "sales_tools"
+
+def sales_tools_route(state: State):
+    messages = state["messages"]
+    last_message = messages[-1]
+    if _is_internal_transfer(last_message):
+        return last_message.artifact["type"][12:] # parse out transfer_to_ prefix
+    return "sales"
+
+def handoff_tools_route(state: State):
+    messages = state["messages"]
+    last_message = messages[-1]
+    if _is_internal_transfer(last_message):
+        return last_message.artifact["type"][12:] # parse out transfer_to_ prefix
+    return "customer"
 
 # -----------------------------------------------------------------------
 # GRAPH DEFINITION ------------------------------------------------------
@@ -234,14 +281,27 @@ def make_graph(memory):
     workflow.add_node("customer", customer_node)
     workflow.add_node("music", music_node)
     workflow.add_node("invoice", invoice_node)
-    workflow.add_node("tools", tool_node)
     workflow.add_node("sales", sales_node)
 
-    workflow.add_conditional_edges("tools", tool_route, {"customer": "customer", "music": "music", "invoice": "invoice", "sales": "sales"})
-    workflow.add_conditional_edges("customer", general_route, {"customer": "customer", "tools": "tools", END: END})
-    workflow.add_conditional_edges("music", general_route, {"customer": "customer", "tools": "tools", END: END})
-    workflow.add_conditional_edges("invoice", general_route, {"customer": "customer", "tools": "tools", END: END})
-    workflow.add_conditional_edges("sales", sales_route, {"customer": "customer", "sales": "sales", "tools": "tools"})
+    workflow.add_node("customer_tools", customer_tool_node)
+    workflow.add_node("music_tools", music_tool_node)
+    workflow.add_node("invoice_tools", invoice_tool_node)
+    workflow.add_node("sales_tools", sales_tool_node)
+    workflow.add_node("handoff_tools", handoff_tool_node)
+
+    workflow.add_conditional_edges("customer", customer_route, 
+        {"customer": "customer", "customer_tools": "customer_tools",
+         "handoff_tools": "handoff_tools", END: END})
+    workflow.add_conditional_edges("music", music_route, {"music_tools": "music_tools", END: END})
+    workflow.add_conditional_edges("invoice", invoice_route, {"invoice_tools": "invoice_tools", END: END})
+    workflow.add_conditional_edges("sales", sales_route, {"sales_tools": "sales_tools"})
+
+    workflow.add_conditional_edges("customer_tools", customer_tools_route, {"customer": "customer"})
+    workflow.add_conditional_edges("music_tools", music_tools_route, {"music": "music", "sales": "sales"})
+    workflow.add_conditional_edges("invoice_tools", invoice_tools_route, {"invoice": "invoice", "sales": "sales"})
+    workflow.add_conditional_edges("sales_tools", sales_tools_route, {"sales": "sales", "music": "music", "invoice": "invoice"})
+    workflow.add_conditional_edges("handoff_tools", handoff_tools_route, {"customer": "customer", "music": "music", "invoice": "invoice"})
+
     workflow.set_entry_point("customer")
     return workflow.compile(checkpointer=memory)
 
@@ -296,6 +356,9 @@ async def run(graph: StateGraph):
                 # Print any node outputs
                 for key, value in output.items():
                     print_messages(value)
+                    # print("----")
+                    # print(key)
+                    # print(value)
 
                     if key == "__interrupt__":
                         interrupted = True

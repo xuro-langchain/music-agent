@@ -277,11 +277,12 @@ def finalize_upsell_decision(upsell: bool, song: str | None, tool_call_id: Annot
     message = "No, do not upsell"
     if upsell and song is not None:
         message = "Yes, upsell {}".format(song)
+    
     tool_message = ToolMessage(
-        content=f"Final upsell decision: {message}",
+        content=message,
         tool_call_id=tool_call_id,
         name="finalize_upsell_decision",
-        artifact={"type": "transfer_to_invoice"},
+        artifact={"type": "transfer_to_invoice", "song": song},
     )
     return Command(
         goto='invoice',
