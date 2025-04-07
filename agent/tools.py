@@ -36,13 +36,13 @@ def verify_customer_info(customer_id: int, tool_call_id: Annotated[str, Injected
                 content="Successfully verified customer information",
                 tool_call_id=tool_call_id,
                 name="verify_customer_info",
-                artifact={"type": "transfer_to_customer", "customer_id": customer_id},
+                artifact={"type": "transfer_to_customer", "customer_id": customer_id,},
             )
             return Command(
                 goto='customer',
                 update={
                     "messages": [tool_message],
-                    "customer_id": customer_id
+                    "customer_id": customer_id,
                 },
             )
     tool_message = ToolMessage(
@@ -98,9 +98,9 @@ def create_invoice(songs: list[str], customer_id: int, tool_call_id: Annotated[s
         customer_id: ID of the customer making the purchase
     """
     if not customer_id:
-        return "Error: Customer ID is required to create an invoice"
+        return "Transaction failed: Customer ID is required to create an invoice"
     if not songs:
-        return "Error: No songs provided for invoice"
+        return "Transaction failed: No songs provided for invoice"
     
     # Find track IDs for the songs
     tracks = []
@@ -123,7 +123,7 @@ def create_invoice(songs: list[str], customer_id: int, tool_call_id: Annotated[s
                 tracks.append((track_id, track_name, price))
     
     if not tracks:
-        return "Error: No matching tracks found for the provided songs"
+        return "Transaction failed: No matching tracks found for the provided songs"
     
     interrupt_message =  "You will be purchasing the following songs: {}".format([track[1] for track in tracks]) + \
     ". Your total is: {}".format(sum([float(track[2]) for track in tracks])) + \
@@ -132,15 +132,9 @@ def create_invoice(songs: list[str], customer_id: int, tool_call_id: Annotated[s
         {"query": interrupt_message}
     )       
     response = human_response["data"]
-    if response.lower() != "yes":
-        tool_message = ToolMessage(
-            content="Transaction cancelled by customer",
-            tool_call_id=tool_call_id,
-            name="create_invoice",
-            artifact={"type": "transfer_to_invoice", "invoice_id": None},
-        )
-        Command(goto='invoice', update={"messages": [tool_message]})
 
+    if response.lower() != "yes":
+        return "Transaction failed: cancelled by customer"
     try:
         # Create new invoice
         invoice_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -174,19 +168,13 @@ def create_invoice(songs: list[str], customer_id: int, tool_call_id: Annotated[s
             tool_message = ToolMessage(
                 content="Transaction successfully completed!",
                 tool_call_id=tool_call_id,
-                artifact={"type": "transfer_to_sales", "invoice_id": invoice_id},
-                name="create_invoice"
+                name="create_invoice",
+                artifact={"type": "transfer_to_sales", "customer_id": customer_id},
             )
             return Command(goto='sales', update={"messages": [tool_message]})
-        tool_message = ToolMessage(
-            content="Transaction encountered error",
-            tool_call_id=tool_call_id,
-            artifact={"type": "transfer_to_invoice", "invoice_id": None},
-            name="create_invoice",
-        )
-        return Command(goto='invoice', update={"messages": [tool_message]})
+        return "Transaction failed: database error."
     except Exception as e:
-        return f"Error creating invoice: {str(e)}"
+        return f"Transaction failed: runtime error {str(e)}"
 
 @tool
 def check_upsell_eligibility(customer_id: int):
@@ -272,16 +260,16 @@ def finalize_upsell_decision(upsell: bool, song: str | None, tool_call_id: Annot
     """Finalize whether or not to upsell the customer. Song must be provided if upselling - if it is not, no upsell will be made"""
     message = "No, do not upsell"
     if upsell and song is not None:
-        message = "Yes, upsell {}".format(song)
+        message = "Yes, offer to add {} to the customer's purchase".format(song)
     
     tool_message = ToolMessage(
         content=message,
         tool_call_id=tool_call_id,
         name="finalize_upsell_decision",
-        artifact={"type": "transfer_to_invoice", "song": song},
+        artifact={"type": "transfer_to_customer", "song": song},
     )
     return Command(
-        goto='invoice',
+        goto='customer',
         update={ "messages": [tool_message]},
     )
 
@@ -294,7 +282,7 @@ def make_handoff_tool(*, agent_name: str):
     def handoff(
         tool_call_id: Annotated[str, InjectedToolCallId],
     ):
-        """Ask another agent for help."""
+        """Transfer customer to another agent."""
         tool_message = ToolMessage(
             content=f"Successfully transferred to {agent_name}",
             name=tool_name,

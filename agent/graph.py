@@ -39,74 +39,85 @@ def add_name(message, name):
     _dict["name"] = name
     return AIMessage(**_dict)
 
-
-async def customer_node(state: State):
-    customer_prompt = """Your job is to help as a customer service representative for a music store.
     
-    You should interact politely with customers to try to figure out how you can help. You can help in a few ways:
-    - Identifying the user: you MUST obtain and the customer's ID and verify their identity before helping them.
-    - Buying or refunding: if a customer wants make a new invoice, or refund an invoice. Handoff to the invoice agent `invoice`
-    - Recomending music: if a customer wants to find some music or information about music. Handoff to the music agent `music`
+async def customer_node(state: State):
+    if "customer_id" not in state or not state["customer_id"]:
+        customer_prompt = """ 
+        You are an AI Agent assisting a customer. You must request their ID before helping them.
 
-    If the user is asking about music and has verified their customer ID, send them to that route.
-    If the user is asking about invoices and has verified their customer ID, send them to that route.
-    Otherwise, respond."""
+        Once the customer has provided their ID, you should use the following tool to verify their identity:
+        - Verifying the user: you MUST obtain the customers ID and verify their info before helping them.
+        
+        Otherwise, respond politely to the customer.
+        """
+    else:
+        customer_prompt = """You are an AI Agent assisting a customer.
+        Your job is to help as a customer service representative for a music store.
+        
+        You should interact politely with customers to figure out how you can help. 
+        You have ONLY these tools available:
+        - Transfer to invoice: transfers to the invoice agent, which will handle making new invoices.
+        - Transfer to music: transfers to the music agent, which will handle music recommendations.
+
+        DO NOT attempt to call any other tools that might be mentioned in the conversation history.
+
+        IMPORTANT: You may not be able to fully complete the customer's request in one go. In such cases, you should break down the task step by step using your tools.
+        
+        When recommending songs based on genre, sometimes the genre will not be found. Instead, you will be returned information on similar songs and artists. This is intentional, it IS NOT a mistake.
+        If you have finalized the decision to upsell, never use the word "upsell". Instead, offer to add the upsell to the customer's purchase.
+        """
     
     formatted = [SystemMessage(content=customer_prompt)] + state["messages"]
-    
-    chain = model.bind_tools([
-        verify_customer_info,
-        music_handoff,
-        invoice_handoff,
-    ]) | partial(add_name, name="customer")
+
+    if "customer_id" not in state or not state["customer_id"]:
+        chain = model.bind_tools([
+            verify_customer_info,
+        ], tool_choice="auto", parallel_tool_calls=False) | partial(add_name, name="customer")
+    else:
+        chain = model.bind_tools([
+            music_handoff,
+            invoice_handoff,
+        ], tool_choice="auto", parallel_tool_calls=False) | partial(add_name, name="customer")
     response = await chain.ainvoke(formatted)
+
     return {"messages": [response]}
 
 
 async def music_node(state: State):
-    song_system_message = """Your job is to recommend songs. Requests may come directly from a customer, or on their behalf by another AI agent.
+    music_prompt = """
+    You are an agent being directed by an AI supervisor.
+    You have in memory the conversation history between the supervisor and a customer. 
+    You should help the supervisor handle any requests related to music.
     
     You have tools available to help recommend songs. You can: 
     - Check if a song exists
     - Recommend songs based on genre
 
-    IMPORTANT: If you do not have the customer's ID, or \
-    the customer asks for ANYTHING not related to music recommendations, \
-    respond that you need to transfer the customer to the customer agent.
-
-    When recommending songs based on genre, sometimes the genre will not be found. In that case, the tools will return information \
-    on simliar songs and artists. This is intentional, it IS NOT the tool messing up.
+    IMPORTANT: If you do not have the customer's ID, reply that you need the customer's ID.
+    IMPORTANT: Only take actions related to music. Ignore requests in the conversation history unrelated to music.
     """
     
-    formatted = [SystemMessage(content=song_system_message)] + state["messages"]
-
-    tool_choice = "auto"
-    if _is_internal_transfer(state["messages"][-1]):
-        transfer_node = _get_internal_transfer_source(state["messages"], "music")
-        if transfer_node and transfer_node != "customer":
-            tool_choice = "any"
+    formatted = [SystemMessage(content=music_prompt)] + state["messages"]
 
     chain = model.bind_tools([
         recommend_songs_by_genre, 
         check_for_songs,
-    ], tool_choice=tool_choice) | partial(add_name, name="music")
+    ], tool_choice="any", parallel_tool_calls=False) | partial(add_name, name="music")
     response = await chain.ainvoke(formatted)
     return {"messages": [response]}
 
 
 async def invoice_node(state: State):
-    invoice_prompt = """Your job is to help a customer with anything related to invoices or billing. 
+    invoice_prompt = """
+    You are an agent being directed by an AI supervisor.
+    You have in memory the conversation history between the supervisor and a customer. 
+    You should help the supervisor handle any requests related to invoices and purchases.
     
     You have tools available to help take actions on invoices. You can:
     - Make a new invoice, which represents selling one or more songs to a customer
     
-    IMPORTANT: If you do not have the customer's ID, or \
-    the customer asks for ANYTHING you cannot accomplish with your tools, \
-    respond that you need to transfer the customer to the customer agent.
-
-    IMPORTANT: If you are making a new invoice as a result of an upsell, you should tell the customer that you \
-    have found additional songs they may like. NEVER use the word "upsell" in your response, instead use language like "I \
-    have found some songs that I think you might like".
+    IMPORTANT: If you do not have the customer's ID, reply that you need the customer's ID.
+    IMPORTANT: Only take actions related to invoices. Ignore requests in the conversation history unrelated to invoices.
     """
     
     formatted = [SystemMessage(content=invoice_prompt)] + state["messages"]
@@ -114,14 +125,13 @@ async def invoice_node(state: State):
     # Get response from model
     chain = model.bind_tools([
         create_invoice,
-    ]) | partial(add_name, name="invoice")
+    ], tool_choice="any", parallel_tool_calls=False) | partial(add_name, name="invoice")
     response = await chain.ainvoke(formatted)
     return {"messages": [response]}
 
 
 async def sales_node(state: State):
-    sales_prompt = """Your job is to determine whether to sell \
-    additional songs (upsell) to the customer after a purchase.
+    sales_prompt = """Your job is to determine whether to sell additional songs (upsell) to the customer after a purchase.
     
     You must call one of the following tools:
     - Check customer eligibility for upselling. 
@@ -137,13 +147,13 @@ async def sales_node(state: State):
         check_upsell_eligibility,
         get_recommended_upsells,
         finalize_upsell_decision,
-    ], tool_choice="any") | partial(add_name, name="sales")
+    ], tool_choice="any", parallel_tool_calls=False) | partial(add_name, name="sales")
     response = await chain.ainvoke(formatted)
     return {"messages": [response]}
 
 
 # Define available tools
-customer_tools = [verify_customer_info]
+customer_tools = [verify_customer_info, music_handoff, invoice_handoff]
 customer_tool_node = ToolNode(tools=customer_tools)
 
 music_tools = [recommend_songs_by_genre, check_for_songs]
@@ -154,9 +164,6 @@ invoice_tool_node = ToolNode(tools=invoice_tools)
 
 sales_tools = [check_upsell_eligibility, get_recommended_upsells, finalize_upsell_decision]
 sales_tool_node = ToolNode(tools=sales_tools)
-
-handoff_tools = [music_handoff, invoice_handoff]
-handoff_tool_node = ToolNode(tools=handoff_tools)
 
 
 # -----------------------------------------------------------------------
@@ -171,12 +178,6 @@ def _get_last_ai_message(messages):
 
 def _is_tool_call(msg):
     return hasattr(msg, "additional_kwargs") and 'tool_calls' in msg.additional_kwargs
-
-def _get_tools_called(msg) -> list[str]:
-    calls = []
-    for call in msg.additional_kwargs["tool_calls"]:
-        calls.append(call["function"]["name"])
-    return calls
 
 def _is_internal_transfer(msg):
     return isinstance(msg, ToolMessage) and hasattr(msg, "artifact") and \
@@ -204,51 +205,34 @@ def customer_route(state: State):
     if not _is_tool_call(last_ai_message):
         return END
     else:
-        calls = _get_tools_called(last_ai_message)
-        transfers = [call for call in calls if call.startswith("transfer_to_")]
-        if len(transfers) != 0 and len(transfers) != 1:
-            raise ValueError("Multiple transfers in a single tool call")
-        if len(transfers) == 1:
-            return "handoff_tools"
-        if len(transfers) == 0:
-            return "customer_tools"
+        return "customer_tools"
 
 def customer_tools_route(state: State):
+    messages = state["messages"]
+    last_message = messages[-1]
+    if _is_internal_transfer(last_message):
+        return last_message.artifact["type"][12:] # parse out transfer_to_ prefix
     return "customer"
     
 def music_route(state: State):
-    messages = state["messages"]
-    last_ai_message = _get_last_ai_message(messages)
-    if last_ai_message is None:
-        return END
-    if not _is_tool_call(last_ai_message):
-        return END
-    else:
-        return "music_tools"
+    return "music_tools"
 
 def music_tools_route(state: State):
     messages = state["messages"]
     transfer_node = _get_internal_transfer_source(messages, "music")
     if transfer_node and transfer_node != "customer":
         return transfer_node
-    return "music"
+    return "customer"
 
 def invoice_route(state: State):
-    messages = state["messages"]
-    last_ai_message = _get_last_ai_message(messages)
-    if last_ai_message is None:
-        return END
-    if not _is_tool_call(last_ai_message):
-        return END
-    else:
-        return "invoice_tools"
+    return "invoice_tools"
 
 def invoice_tools_route(state: State):
     messages = state["messages"]
     last_message = messages[-1]
     if _is_internal_transfer(last_message):
         return last_message.artifact["type"][12:] # parse out transfer_to_ prefix
-    return "invoice"
+    return "customer"
 
 def sales_route(state: State):
     return "sales_tools"
@@ -259,13 +243,6 @@ def sales_tools_route(state: State):
     if _is_internal_transfer(last_message):
         return last_message.artifact["type"][12:] # parse out transfer_to_ prefix
     return "sales"
-
-def handoff_tools_route(state: State):
-    messages = state["messages"]
-    last_message = messages[-1]
-    if _is_internal_transfer(last_message):
-        return last_message.artifact["type"][12:] # parse out transfer_to_ prefix
-    return "customer"
 
 # -----------------------------------------------------------------------
 # GRAPH DEFINITION ------------------------------------------------------
@@ -285,21 +262,18 @@ def make_graph(memory):
     workflow.add_node("music_tools", music_tool_node)
     workflow.add_node("invoice_tools", invoice_tool_node)
     workflow.add_node("sales_tools", sales_tool_node)
-    workflow.add_node("handoff_tools", handoff_tool_node)
 
     workflow.add_conditional_edges("customer", customer_route, 
-        {"customer": "customer", "customer_tools": "customer_tools",
-         "handoff_tools": "handoff_tools", END: END})
-    workflow.add_conditional_edges("music", music_route, {"music_tools": "music_tools", END: END})
-    workflow.add_conditional_edges("invoice", invoice_route, {"invoice_tools": "invoice_tools", END: END})
+        {"customer": "customer", "customer_tools": "customer_tools", END: END})
+    workflow.add_conditional_edges("music", music_route, {"music_tools": "music_tools"})
+    workflow.add_conditional_edges("invoice", invoice_route, {"invoice_tools": "invoice_tools"})
     workflow.add_conditional_edges("sales", sales_route, {"sales_tools": "sales_tools"})
 
-    workflow.add_conditional_edges("customer_tools", customer_tools_route, {"customer": "customer"})
-    workflow.add_conditional_edges("music_tools", music_tools_route, {"music": "music", "sales": "sales"})
-    workflow.add_conditional_edges("invoice_tools", invoice_tools_route, {"invoice": "invoice", "sales": "sales"})
-    workflow.add_conditional_edges("sales_tools", sales_tools_route, {"sales": "sales", "music": "music", "invoice": "invoice"})
-    workflow.add_conditional_edges("handoff_tools", handoff_tools_route, {"customer": "customer", "music": "music", "invoice": "invoice"})
-
+    workflow.add_conditional_edges("customer_tools", customer_tools_route, {"customer": "customer",  "music": "music", "invoice": "invoice"})
+    workflow.add_conditional_edges("music_tools", music_tools_route, {"sales": "sales", "customer": "customer"})
+    workflow.add_conditional_edges("invoice_tools", invoice_tools_route, {"sales": "sales", "customer": "customer"})
+    workflow.add_conditional_edges("sales_tools", sales_tools_route, {"sales": "sales", "music": "music", "customer": "customer"})
+   
     workflow.set_entry_point("customer")
     return workflow.compile(checkpointer=memory)
 
@@ -315,14 +289,13 @@ def print_messages(response):
         messages = response["messages"]
         for message in messages:
             if isinstance(message, AIMessage) and message.content:
-                print(f"{message.name.upper()} AI: {message.content}")
+                print(f"AI: {message.content}")
             if isinstance(message, ToolMessage):
                 print(f"Tool called: {message.name}")
 
 async def run(graph: StateGraph):
     state: State = {
         "messages": [],
-        "customer_id": None
     }
 
     thread_id = random.randint(0, 1000000)
@@ -344,19 +317,16 @@ async def run(graph: StateGraph):
             interrupted = False
         else:
             # Add user message to state
-            state["messages"].append(HumanMessage(content=user))
+            state["messages"] = [HumanMessage(content=user)]
             turn_input = state
         try:
             # Stream responses
-            async for output in graph.astream(turn_input, config):
+            async for output in graph.astream(turn_input, config, stream_mode="updates"):
                 if END in output or START in output:
                     continue
                 # Print any node outputs
                 for key, value in output.items():
                     print_messages(value)
-                    # print("----")
-                    # print(key)
-                    # print(value)
 
                     if key == "__interrupt__":
                         interrupted = True
