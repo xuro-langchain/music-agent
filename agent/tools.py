@@ -260,7 +260,7 @@ def finalize_upsell_decision(upsell: bool, song: str | None, tool_call_id: Annot
     """Finalize whether or not to upsell the customer. Song must be provided if upselling - if it is not, no upsell will be made"""
     message = "No, do not upsell"
     if upsell and song is not None:
-        message = "Yes, offer to add {} to the customer's purchase".format(song)
+        message = "Yes, offer to create an additional invoice for {}".format(song)
     
     tool_message = ToolMessage(
         content=message,
