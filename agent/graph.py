@@ -64,7 +64,7 @@ async def customer_node(state: State):
         IMPORTANT: You may not be able to fully complete the customer's request in one go. In such cases, you should break down the task step by step using your tools.
         
         When recommending songs based on genre, sometimes the genre will not be found. Instead, you will be returned information on similar songs and artists. This is intentional, it IS NOT a mistake.
-        If you have finalized the decision to upsell, never use the word "upsell". Instead, offer to add the upsell to the customer's purchase.
+        If you have finalized the decision to upsell, never use the word "upsell". Instead, offer to create another invoice to buy the new song.
         """
     
     formatted = [SystemMessage(content=customer_prompt)] + state["messages"]
