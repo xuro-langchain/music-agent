@@ -7,7 +7,7 @@ from langgraph.types import Command, interrupt
 from langchain_core.tools.base import InjectedToolCallId
 from langchain_core.messages import ToolMessage
 
-from db import db, song_retriever, genre_retriever
+from musically.db import db, song_retriever, genre_retriever
 
 @tool
 def verify_customer_info(customer_id: int, tool_call_id: Annotated[str, InjectedToolCallId] ):
